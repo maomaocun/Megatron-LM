@@ -164,6 +164,7 @@ def get_mock_mla_config(
     fp8_recipe: str = "delayed",
     fp4: Optional[str] = None,
     fp4_recipe: str = "nvfp4",
+    qk_layernorm: bool = True,
 ) -> MLATransformerConfig:
     """Create test config with all attributes used in MLA."""
     return MLATransformerConfig(
@@ -180,6 +181,7 @@ def get_mock_mla_config(
         params_dtype=torch.bfloat16,
         layernorm_epsilon=1e-5,
         normalization="RMSNorm",
+        qk_layernorm=qk_layernorm,
         layernorm_zero_centered_gamma=False,
         expert_model_parallel_size=1,
         tensor_model_parallel_size=tensor_model_parallel_size,
