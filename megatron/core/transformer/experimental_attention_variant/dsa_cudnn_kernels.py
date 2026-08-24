@@ -1194,7 +1194,10 @@ def _resolve_scoring_plan_for_call(
         # Non-packed callers cannot report their mask type from here; they are
         # treated as causal, so a non-causal non-packed layout lands on the generic
         # "not reconstructible" reason rather than the dedicated non-causal one.
-        # The dispatch outcome (UNFUSED_BOUNDS) is the same either way.
+        # Likewise packed_thd below is inferred from what the packed kernels could
+        # consume, so a packed layout no packed kernel claims is diagnosed with the
+        # non-packed reason. The dispatch outcome (UNFUSED_BOUNDS) is the same in
+        # every such case; only the diagnostic wording is generic.
         mask_is_causal=use_local_indexer_varlen or not packed_thd,
         explicit_key_positions=False,
         single_sequence_pack=single_packed_thd_sequence,

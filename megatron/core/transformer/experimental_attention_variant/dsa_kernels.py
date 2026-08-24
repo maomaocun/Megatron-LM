@@ -133,7 +133,15 @@ def run_fused_qk_topk(
     cp_size: int = 1,
     varlen_is_plain_causal: bool = False,
 ) -> Optional[Tuple[Tensor, Optional[Tensor]]]:
-    """Optional fused indexer hook for backend-specific implementations."""
+    """Optional fused indexer hook for backend-specific implementations.
+
+    Contract note (changed in this release): ``single_packed_thd_sequence`` and
+    ``use_local_indexer_varlen`` describe the layout only -- a single-sequence pack
+    and a packed causal layout with identity key positions -- and no longer imply
+    ``cp_size > 1``. Backends deciding kernel applicability from them must consult
+    ``cp_size`` (and their own shape preconditions) rather than assume a zigzag
+    split with an even local length.
+    """
     fn = _resolve_fused_hook(config, "run_fused_qk_topk")
     if fn is None:
         return None
@@ -186,7 +194,15 @@ def run_fused_qk_topk_with_loss(
     cp_size: int = 1,
     varlen_is_plain_causal: bool = False,
 ) -> Optional[Tuple[Tensor, Optional[Tensor], Tensor]]:
-    """Optional fused indexer+loss hook for backend-specific implementations."""
+    """Optional fused indexer+loss hook for backend-specific implementations.
+
+    Contract note (changed in this release): ``single_packed_thd_sequence`` and
+    ``use_local_indexer_varlen`` describe the layout only -- a single-sequence pack
+    and a packed causal layout with identity key positions -- and no longer imply
+    ``cp_size > 1``. Backends deciding kernel applicability from them must consult
+    ``cp_size`` (and their own shape preconditions) rather than assume a zigzag
+    split with an even local length.
+    """
     fn = _resolve_fused_hook(config, "run_fused_qk_topk_with_loss")
     if fn is None:
         return None
@@ -272,7 +288,15 @@ def run_fused_dsa_attention(
     local_packed_cp_query_len: Optional[int] = None,
     pg_collection: Optional[ProcessGroupCollection] = None,
 ) -> Optional[Tuple[Tensor, Tensor]]:
-    """Optional full fused DSA hook for backends that fuse indexer and attention together."""
+    """Optional full fused DSA hook for backends that fuse indexer and attention together.
+
+    Contract note (changed in this release): ``single_packed_thd_sequence`` and
+    ``use_local_indexer_varlen`` describe the layout only -- a single-sequence pack
+    and a packed causal layout with identity key positions -- and no longer imply
+    ``cp_size > 1``. Backends deciding kernel applicability from them must consult
+    ``cp_size`` (and their own shape preconditions) rather than assume a zigzag
+    split with an even local length.
+    """
     fn = _resolve_fused_hook(config, "run_fused_dsa_attention")
     if fn is None:
         return None

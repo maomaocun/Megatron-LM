@@ -24,7 +24,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Optional
 
-from megatron.core._rank_utils import log_single_rank
+import torch
 
 
 class IndexerScoringPlan(Enum):
@@ -184,9 +184,13 @@ def report_unfused_scoring_once(decision: IndexerScoringDecision, context: str) 
     if key in _REPORTED_UNFUSED:
         return None
     _REPORTED_UNFUSED.add(key)
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
     message = (
-        f"DSA indexer scoring falls back to the unfused per-head loop ({context}): "
-        f"{decision.reason}."
+        f"DSA indexer scoring falls back to the unfused per-head loop ({context}, "
+        f"rank {rank}): {decision.reason}."
     )
-    log_single_rank(logging.getLogger(__name__), logging.WARNING, message)
+    # Deliberately not rank-0-only: with heterogeneous packs a non-zero rank can sit
+    # on the unfused cliff while rank 0 stays fused, which is exactly the silent case
+    # this exists to surface. The once-per-reason set bounds the volume per process.
+    logging.getLogger(__name__).warning(message)
     return message
