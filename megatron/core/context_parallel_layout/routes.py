@@ -286,15 +286,17 @@ def prebuild_thd_cp_partition_routes(
     # device-to-host readback behind the whole queued iteration. Doing the copy
     # here is cheap for the same reason the route build is: at batch-construction
     # time the CUDA queue is still shallow.
+    # getattr: the pre-existing contract of this function (see the unit tests) is
+    # any object carrying the q-side fields, so the kv-side reads must not widen it.
+    cu_q_padded = getattr(packed_seq_params, "cu_seqlens_q_padded", None)
     cu_q = (
-        packed_seq_params.cu_seqlens_q_padded
-        if packed_seq_params.cu_seqlens_q_padded is not None
-        else packed_seq_params.cu_seqlens_q
+        cu_q_padded if cu_q_padded is not None else getattr(packed_seq_params, "cu_seqlens_q", None)
     )
+    cu_kv_padded = getattr(packed_seq_params, "cu_seqlens_kv_padded", None)
     cu_kv = (
-        packed_seq_params.cu_seqlens_kv_padded
-        if packed_seq_params.cu_seqlens_kv_padded is not None
-        else packed_seq_params.cu_seqlens_kv
+        cu_kv_padded
+        if cu_kv_padded is not None
+        else getattr(packed_seq_params, "cu_seqlens_kv", None)
     )
     host_q = _compact_thd_cu_seqlens_to_list(cu_q) if cu_q is not None else None
     if cu_kv is None or cu_kv is cu_q:
