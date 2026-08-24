@@ -2,7 +2,7 @@
 
 """Layout helpers for DeepSeek sparse attention."""
 
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 
@@ -358,6 +358,134 @@ def build_packed_allgather_cp_query_positions_and_key_reorder(
             f"expected {global_output_size}"
         )
     return query_positions, key_reorder_idx
+
+
+def _host_packed_cp_spans(
+    host_cu_seqlens: List[int], cp_size: int, cp_rank: int
+) -> List[Tuple[int, int]]:
+    """One rank's zigzag layout as ``(global_start, length)`` spans, from host ints.
+
+    The span decomposition is the same maths as the device builders above, but on a
+    Python list there is nothing to synchronize on: every length is already known.
+    Zero-length sequences contribute no spans, matching the device builders' filter.
+    """
+    spans: List[Tuple[int, int]] = []
+    for seq_start, seq_end in zip(host_cu_seqlens[:-1], host_cu_seqlens[1:]):
+        half = (seq_end - seq_start) // cp_size // 2
+        if half <= 0:
+            continue
+        spans.append((seq_start + cp_rank * half, half))
+        spans.append((seq_end - (cp_rank + 1) * half, half))
+    return spans
+
+
+def _host_to_device(values: torch.Tensor, device: torch.device) -> torch.Tensor:
+    """Move a freshly built host tensor to ``device`` without blocking the CPU."""
+    if device.type == "cuda":
+        return values.pin_memory().to(device, non_blocking=True)
+    return values.to(device)
+
+
+def build_packed_allgather_cp_local_positions_from_host(
+    host_cu_seqlens: List[int],
+    cp_size: int,
+    cp_rank: int,
+    device: torch.device,
+    output_size: Optional[int] = None,
+    *,
+    cu_seqlens_cover_output: bool = False,
+) -> torch.Tensor:
+    """Host-side equivalent of :func:`build_packed_allgather_cp_local_positions`.
+
+    The device builder runs ~20 kernels over a few dozen integers and pays two
+    device-to-host size readbacks for its boolean-mask filters. When the compacted
+    ``cu_seqlens`` are already on the host -- ``prebuild_thd_cp_partition_routes``
+    stores them on ``PackedSeqParams`` at batch-construction time, where the one
+    blocking copy is cheap because the CUDA queue is still shallow -- the whole
+    table is a closed form over Python ints: zero kernels, zero synchronization,
+    one asynchronous host-to-device copy of the finished table.
+    """
+    spans = _host_packed_cp_spans(host_cu_seqlens, cp_size, cp_rank)
+    real = (
+        torch.cat([torch.arange(start, start + length) for start, length in spans])
+        if spans
+        else torch.empty(0, dtype=torch.int64)
+    )
+    total = real.numel()
+    if output_size is None:
+        output_size = total
+    positions = torch.empty(output_size, dtype=torch.int64)
+    n = min(total, output_size)
+    positions[:n] = real[:n]
+    if output_size > n:
+        # The cover flag only ever accompanies output_size == total (dsa.py derives it
+        # from host max-seqlen metadata), so this branch is the not-covered case; fill
+        # it unconditionally rather than leave torch.empty garbage if a caller lies.
+        pad_start = host_cu_seqlens[-1] + cp_rank * output_size
+        positions[n:] = torch.arange(pad_start, pad_start + (output_size - n))
+    return _host_to_device(positions, device)
+
+
+def build_packed_allgather_cp_query_positions_and_key_reorder_from_host(
+    host_cu_seqlens_q: List[int],
+    host_cu_seqlens_kv: List[int],
+    cp_size: int,
+    cp_rank: int,
+    device: torch.device,
+    local_output_size: Optional[int] = None,
+    key_local_output_size: Optional[int] = None,
+    global_output_size: Optional[int] = None,
+    *,
+    query_cu_seqlens_cover_output: bool = False,
+    key_cu_seqlens_cover_output: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Host-side equivalent of the query-positions + key-reorder wrapper.
+
+    Besides removing the device builders' synchronizations, this replaces the
+    ``argsort`` over the gathered key positions with a direct inverse permutation.
+    The sort is unnecessary because the real positions of all ranks tile
+    ``[0, total_tokens)`` exactly once (every padded sequence length is divisible
+    by ``2 * cp_size``), so the rank of a value in sorted order *is* the value;
+    and the padding pseudo-positions ``total + r * output_size + j`` are unique
+    and already ascending in ``(rank, j)`` order. Both facts are pinned by the
+    bit-equality tests against the device path.
+    """
+    query_positions = build_packed_allgather_cp_local_positions_from_host(
+        host_cu_seqlens_q,
+        cp_size,
+        cp_rank,
+        device,
+        output_size=local_output_size,
+        cu_seqlens_cover_output=query_cu_seqlens_cover_output,
+    )
+    if key_local_output_size is None:
+        key_local_output_size = local_output_size
+
+    kv_total = host_cu_seqlens_kv[-1]
+    spans_by_rank = [
+        _host_packed_cp_spans(host_cu_seqlens_kv, cp_size, rank) for rank in range(cp_size)
+    ]
+    real_len = sum(length for _, length in spans_by_rank[0]) if spans_by_rank else 0
+    out = key_local_output_size if key_local_output_size is not None else real_len
+    pad = max(0, out - real_len)
+    n = cp_size * out
+    if global_output_size is not None and n != global_output_size:
+        raise RuntimeError(
+            f"Packed DSA CP key reorder length mismatch: got {n}, " f"expected {global_output_size}"
+        )
+    key_reorder_idx = torch.empty(n, dtype=torch.int64)
+    for rank, spans in enumerate(spans_by_rank):
+        local = 0
+        for global_start, length in spans:
+            key_reorder_idx[global_start : global_start + length] = torch.arange(
+                rank * out + local, rank * out + local + length
+            )
+            local += length
+        if pad > 0:
+            key_reorder_idx[kv_total + rank * pad : kv_total + (rank + 1) * pad] = torch.arange(
+                rank * out + local, rank * out + out
+            )
+    return query_positions, _host_to_device(key_reorder_idx, device)
 
 
 def extract_query_positions_from_position_ids(

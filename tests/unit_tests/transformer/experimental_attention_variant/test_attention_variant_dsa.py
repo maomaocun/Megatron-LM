@@ -40,7 +40,9 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
 from megatron.core.transformer.experimental_attention_variant.dsa_layout import (
     build_packed_allgather_cp_all_rank_positions,
     build_packed_allgather_cp_local_positions,
+    build_packed_allgather_cp_local_positions_from_host,
     build_packed_allgather_cp_query_positions_and_key_reorder,
+    build_packed_allgather_cp_query_positions_and_key_reorder_from_host,
     build_zigzag_allgather_cp_key_reorder,
     extract_query_positions_from_position_ids,
     get_cp_positions_from_layout,
@@ -4008,3 +4010,122 @@ class TestPackedCPAllRankPositions:
             )
         )
         assert torch.equal(key_reorder_idx, reference)
+
+
+class TestHostSidePackedCpLayoutBuilders:
+    """The host builders must be bit-equal to the device builders they replace.
+
+    The host path consumes the compacted cu_seqlens list that
+    prebuild_thd_cp_partition_routes stores on PackedSeqParams; the device path
+    consumes the raw device tensor. e2e loss cannot discriminate here (the
+    training workload is not run-to-run reproducible), so bit equality of the
+    produced tables is the correctness contract.
+    """
+
+    @staticmethod
+    def _cu_seqlens(seq_lens, cp_size):
+        multiple = 2 * cp_size
+        padded = [0 if s == 0 else -(-s // multiple) * multiple for s in seq_lens]
+        offsets = [0]
+        for p in padded:
+            offsets.append(offsets[-1] + p)
+        return torch.tensor(offsets, dtype=torch.int32)
+
+    @staticmethod
+    def _host_list(cu_seqlens):
+        """Compacted host list, matching _compact_thd_cu_seqlens_to_list semantics."""
+        values = cu_seqlens.tolist()
+        compact = [values[0]]
+        for v in values[1:]:
+            if v != compact[-1]:
+                compact.append(v)
+        return compact
+
+    @pytest.mark.parametrize("cp_size", [1, 2, 4, 8, 16])
+    @pytest.mark.parametrize(
+        "seq_lens", [[512], [512, 1024], [256, 256, 512], [128, 384, 640, 896], [1024, 0, 2048]]
+    )
+    @pytest.mark.parametrize("cover", [True, False])
+    def test_local_positions_match_device_builder(self, cp_size, seq_lens, cover):
+        """Every rank's host-built positions equal the device builder's output."""
+        device = torch.device("cpu")
+        cu_seqlens = self._cu_seqlens(seq_lens, cp_size)
+        total = int(cu_seqlens[-1])
+        if total == 0:
+            pytest.skip("degenerate all-empty case")
+        output_size = total // cp_size
+        host_cu = self._host_list(cu_seqlens)
+        for rank in range(cp_size):
+            expected = build_packed_allgather_cp_local_positions(
+                cu_seqlens,
+                cp_size,
+                rank,
+                device,
+                output_size=output_size,
+                cu_seqlens_cover_output=cover,
+            )
+            actual = build_packed_allgather_cp_local_positions_from_host(
+                host_cu,
+                cp_size,
+                rank,
+                device,
+                output_size=output_size,
+                cu_seqlens_cover_output=cover,
+            )
+            assert torch.equal(actual, expected), f"rank {rank} differs"
+
+    @pytest.mark.parametrize("cp_size", [2, 4, 8])
+    @pytest.mark.parametrize("seq_lens", [[512], [256, 256, 512], [1024, 0, 2048]])
+    def test_padded_local_positions_match_device_builder(self, cp_size, seq_lens):
+        """Rows still match when output_size exceeds the packed token count."""
+        device = torch.device("cpu")
+        cu_seqlens = self._cu_seqlens(seq_lens, cp_size)
+        total = int(cu_seqlens[-1])
+        output_size = total // cp_size + 64
+        host_cu = self._host_list(cu_seqlens)
+        for rank in range(cp_size):
+            expected = build_packed_allgather_cp_local_positions(
+                cu_seqlens, cp_size, rank, device, output_size=output_size
+            )
+            actual = build_packed_allgather_cp_local_positions_from_host(
+                host_cu, cp_size, rank, device, output_size=output_size
+            )
+            assert torch.equal(actual, expected), f"rank {rank} differs"
+
+    @pytest.mark.parametrize("cp_size", [2, 4, 8, 16])
+    @pytest.mark.parametrize("seq_lens", [[512], [512, 1024], [256, 256, 512], [1024, 0, 2048]])
+    @pytest.mark.parametrize("pad", [0, 64])
+    def test_query_and_reorder_match_device_wrapper(self, cp_size, seq_lens, pad):
+        """The host wrapper (direct inverse, no argsort) equals the device wrapper."""
+        device = torch.device("cpu")
+        cu_seqlens = self._cu_seqlens(seq_lens, cp_size)
+        total = int(cu_seqlens[-1])
+        if total == 0:
+            pytest.skip("degenerate all-empty case")
+        local = total // cp_size + pad
+        host_cu = self._host_list(cu_seqlens)
+        for rank in range(cp_size):
+            expected_q, expected_r = build_packed_allgather_cp_query_positions_and_key_reorder(
+                cu_seqlens_q=cu_seqlens,
+                cu_seqlens_kv=cu_seqlens,
+                cp_size=cp_size,
+                cp_rank=rank,
+                device=device,
+                local_output_size=local,
+                key_local_output_size=local,
+                global_output_size=local * cp_size,
+            )
+            actual_q, actual_r = (
+                build_packed_allgather_cp_query_positions_and_key_reorder_from_host(
+                    host_cu,
+                    host_cu,
+                    cp_size=cp_size,
+                    cp_rank=rank,
+                    device=device,
+                    local_output_size=local,
+                    key_local_output_size=local,
+                    global_output_size=local * cp_size,
+                )
+            )
+            assert torch.equal(actual_q, expected_q), f"rank {rank} query positions differ"
+            assert torch.equal(actual_r, expected_r), f"rank {rank} key reorder differs"

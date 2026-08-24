@@ -278,3 +278,28 @@ def prebuild_thd_cp_partition_routes(
     packed_seq_params.cp_partition_route = build_thd_cp_partition_route(
         cu_seqlens, cp_size, cp_rank, device=device
     )
+
+    # Also expose the compacted cu_seqlens as host integer lists. Consumers that
+    # derive per-token layout metadata from them (e.g. the DSA packed-CP position
+    # builders) can then work entirely on the host instead of re-deriving the same
+    # spans on the device, where the data-dependent shapes force a
+    # device-to-host readback behind the whole queued iteration. Doing the copy
+    # here is cheap for the same reason the route build is: at batch-construction
+    # time the CUDA queue is still shallow.
+    cu_q = (
+        packed_seq_params.cu_seqlens_q_padded
+        if packed_seq_params.cu_seqlens_q_padded is not None
+        else packed_seq_params.cu_seqlens_q
+    )
+    cu_kv = (
+        packed_seq_params.cu_seqlens_kv_padded
+        if packed_seq_params.cu_seqlens_kv_padded is not None
+        else packed_seq_params.cu_seqlens_kv
+    )
+    host_q = _compact_thd_cu_seqlens_to_list(cu_q) if cu_q is not None else None
+    if cu_kv is None or cu_kv is cu_q:
+        host_kv = host_q
+    else:
+        host_kv = _compact_thd_cu_seqlens_to_list(cu_kv)
+    packed_seq_params.thd_cp_host_cu_seqlens_q = host_q
+    packed_seq_params.thd_cp_host_cu_seqlens_kv = host_kv

@@ -23,6 +23,12 @@ from megatron.core.transformer.experimental_attention_variant import (
     dsa_layout,
     dsa_masking,
 )
+from megatron.core.transformer.experimental_attention_variant.dsa_layout import (
+    build_packed_allgather_cp_local_positions_from_host as _build_cp_positions_from_host,
+)
+from megatron.core.transformer.experimental_attention_variant.dsa_layout import (
+    build_packed_allgather_cp_query_positions_and_key_reorder_from_host as _cp_reorder_from_host,
+)
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -1916,6 +1922,12 @@ class DSAttention(MegatronModule):
         layout_cache = self._get_packed_cp_layout_cache(packed_seq_params)
         if packed_thd:
             cu_seqlens_q, cu_seqlens_kv = dsa_layout.get_packed_qk_cu_seqlens(packed_seq_params)
+            # Host copies of the compacted cu_seqlens, stored by
+            # prebuild_thd_cp_partition_routes at batch-construction time. When
+            # present, the layout builders below run entirely on the host: no
+            # kernels, no device readbacks, one async copy of the finished table.
+            host_cu_q = getattr(packed_seq_params, "thd_cp_host_cu_seqlens_q", None)
+            host_cu_kv = getattr(packed_seq_params, "thd_cp_host_cu_seqlens_kv", None)
             # Whether the pack holds one sequence is a fact about the pack, not about
             # context parallelism; which kernels accept that layout is the scoring
             # plan's decision. Consumers that genuinely need CP already test cp_size.
@@ -1933,12 +1945,22 @@ class DSAttention(MegatronModule):
                 packed_query_positions_full = self._memoized(
                     layout_cache,
                     ("local_positions", cp_size, cp_rank, packed_query_output_size),
-                    lambda: dsa_layout.build_packed_allgather_cp_local_positions(
-                        cu_seqlens_q,
-                        cp_size,
-                        cp_rank,
-                        query.device,
-                        output_size=packed_query_output_size,
+                    lambda: (
+                        _build_cp_positions_from_host(
+                            host_cu_q,
+                            cp_size,
+                            cp_rank,
+                            query.device,
+                            output_size=packed_query_output_size,
+                        )
+                        if host_cu_q is not None
+                        else dsa_layout.build_packed_allgather_cp_local_positions(
+                            cu_seqlens_q,
+                            cp_size,
+                            cp_rank,
+                            query.device,
+                            output_size=packed_query_output_size,
+                        )
                     ),
                 )
                 if sequence_parallel_query_is_local:
@@ -1971,17 +1993,32 @@ class DSAttention(MegatronModule):
                         query_cu_seqlens_cover_output,
                         key_cu_seqlens_cover_output,
                     ),
-                    lambda: dsa_layout.build_packed_allgather_cp_query_positions_and_key_reorder(
-                        cu_seqlens_q=cu_seqlens_q,
-                        cu_seqlens_kv=cu_seqlens_kv,
-                        cp_size=cp_size,
-                        cp_rank=cp_rank,
-                        device=query.device,
-                        local_output_size=packed_query_output_size,
-                        key_local_output_size=packed_query_output_size,
-                        global_output_size=packed_global_output_size,
-                        query_cu_seqlens_cover_output=query_cu_seqlens_cover_output,
-                        key_cu_seqlens_cover_output=key_cu_seqlens_cover_output,
+                    lambda: (
+                        _cp_reorder_from_host(
+                            host_cu_q,
+                            host_cu_kv,
+                            cp_size=cp_size,
+                            cp_rank=cp_rank,
+                            device=query.device,
+                            local_output_size=packed_query_output_size,
+                            key_local_output_size=packed_query_output_size,
+                            global_output_size=packed_global_output_size,
+                            query_cu_seqlens_cover_output=query_cu_seqlens_cover_output,
+                            key_cu_seqlens_cover_output=key_cu_seqlens_cover_output,
+                        )
+                        if host_cu_q is not None and host_cu_kv is not None
+                        else dsa_layout.build_packed_allgather_cp_query_positions_and_key_reorder(
+                            cu_seqlens_q=cu_seqlens_q,
+                            cu_seqlens_kv=cu_seqlens_kv,
+                            cp_size=cp_size,
+                            cp_rank=cp_rank,
+                            device=query.device,
+                            local_output_size=packed_query_output_size,
+                            key_local_output_size=packed_query_output_size,
+                            global_output_size=packed_global_output_size,
+                            query_cu_seqlens_cover_output=query_cu_seqlens_cover_output,
+                            key_cu_seqlens_cover_output=key_cu_seqlens_cover_output,
+                        )
                     ),
                 )
             if packed_query_positions is not None:
@@ -2040,7 +2077,20 @@ class DSAttention(MegatronModule):
                             False,
                         ),
                         lambda: (
-                            dsa_layout.build_packed_allgather_cp_query_positions_and_key_reorder(
+                            _cp_reorder_from_host(
+                                host_cu_q,
+                                host_cu_kv,
+                                cp_size=cp_size,
+                                cp_rank=cp_rank,
+                                device=query.device,
+                                local_output_size=local_len,
+                                key_local_output_size=local_len,
+                                global_output_size=local_len * cp_size,
+                            )
+                            if host_cu_q is not None and host_cu_kv is not None
+                            else (
+                                dsa_layout.build_packed_allgather_cp_query_positions_and_key_reorder
+                            )(
                                 cu_seqlens_q=cu_seqlens_q,
                                 cu_seqlens_kv=cu_seqlens_kv,
                                 cp_size=cp_size,
