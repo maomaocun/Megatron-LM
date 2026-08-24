@@ -4092,6 +4092,49 @@ class TestHostSidePackedCpLayoutBuilders:
             )
             assert torch.equal(actual, expected), f"rank {rank} differs"
 
+    @pytest.mark.parametrize("seq_lens", [[5], [7, 3], [1]])
+    def test_cp1_odd_lengths_match_device_identity(self, seq_lens):
+        """cp_size=1 has no zigzag halving, so odd lengths must stay identity.
+
+        The span form floors seq_len // 2 and would silently drop the middle token;
+        the builders take a dedicated identity path instead, mirroring the device
+        builder's cp_size <= 1 branch.
+        """
+        device = torch.device("cpu")
+        offsets = [0]
+        for length in seq_lens:
+            offsets.append(offsets[-1] + length)
+        cu_seqlens = torch.tensor(offsets, dtype=torch.int32)
+        host_cu = offsets
+        total = offsets[-1]
+        expected = build_packed_allgather_cp_local_positions(
+            cu_seqlens, 1, 0, device, output_size=total
+        )
+        actual = build_packed_allgather_cp_local_positions_from_host(
+            host_cu, 1, 0, device, output_size=total
+        )
+        assert torch.equal(actual, expected)
+        _, reorder = build_packed_allgather_cp_query_positions_and_key_reorder_from_host(
+            host_cu,
+            host_cu,
+            cp_size=1,
+            cp_rank=0,
+            device=device,
+            local_output_size=total,
+            key_local_output_size=total,
+        )
+        assert torch.equal(reorder, torch.arange(total, dtype=torch.int64))
+
+    @pytest.mark.parametrize("cp_size", [2, 4])
+    def test_non_divisible_lengths_raise_on_host(self, cp_size):
+        """Host builders reject lengths not divisible by 2*cp_size instead of
+        silently dropping tokens; the check is free on host integers."""
+        bad_cu = [0, 2 * cp_size + 1]
+        with pytest.raises(ValueError, match="divisible"):
+            build_packed_allgather_cp_local_positions_from_host(
+                bad_cu, cp_size, 0, torch.device("cpu")
+            )
+
     @pytest.mark.parametrize("cp_size", [2, 4, 8, 16])
     @pytest.mark.parametrize("seq_lens", [[512], [512, 1024], [256, 256, 512], [1024, 0, 2048]])
     @pytest.mark.parametrize("pad", [0, 64])

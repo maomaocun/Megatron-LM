@@ -19,6 +19,7 @@ from megatron.core.transformer.experimental_attention_variant import (
 from megatron.core.transformer.experimental_attention_variant.dsa_scoring_plan import (
     IndexerScoringDecision,
     IndexerScoringPlan,
+    report_unfused_scoring_once,
     resolve_indexer_scoring_plan,
 )
 from megatron.core.utils import get_pg_size, round_up_to_nearest_multiple
@@ -1190,6 +1191,10 @@ def _resolve_scoring_plan_for_call(
         varlen_is_plain_causal=varlen_is_plain_causal,
         packed_thd=packed_thd,
         cp_size=cp_size,
+        # Non-packed callers cannot report their mask type from here; they are
+        # treated as causal, so a non-causal non-packed layout lands on the generic
+        # "not reconstructible" reason rather than the dedicated non-causal one.
+        # The dispatch outcome (UNFUSED_BOUNDS) is the same either way.
         mask_is_causal=use_local_indexer_varlen or not packed_thd,
         explicit_key_positions=False,
         single_sequence_pack=single_packed_thd_sequence,
@@ -1287,6 +1292,7 @@ def _indexer_topk_bshd(
             ),
         )
     plan = scoring_plan.plan
+    report_unfused_scoring_once(scoring_plan, "indexer scoring")
 
     # PLAIN_CAUSAL means the bounds, if any, are the trivial whole-sequence causal ones
     # that ``_causal_seq_lens`` rebuilds exactly, so the single-kernel scorer applies.

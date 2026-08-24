@@ -19,6 +19,8 @@ __all__ = [
     "get_cp_positions_from_layout",
     "get_packed_qk_cu_seqlens",
     "normalize_cp_comm_type",
+    "build_packed_allgather_cp_local_positions_from_host",
+    "build_packed_allgather_cp_query_positions_and_key_reorder_from_host",
 ]
 
 
@@ -371,7 +373,19 @@ def _host_packed_cp_spans(
     """
     spans: List[Tuple[int, int]] = []
     for seq_start, seq_end in zip(host_cu_seqlens[:-1], host_cu_seqlens[1:]):
-        half = (seq_end - seq_start) // cp_size // 2
+        seq_len = seq_end - seq_start
+        if seq_len == 0:
+            continue
+        # The zigzag layout requires it, and on host integers the check is free --
+        # unlike the device builders, which can only validate without a sync on CPU
+        # inputs. Without it, non-divisible lengths would silently drop tokens here
+        # and leave uninitialized slots in the reorder buffer downstream.
+        if seq_len % (2 * cp_size) != 0:
+            raise ValueError(
+                "Packed DSA CP expects per-sequence padded lengths divisible by "
+                f"2 * cp_size ({2 * cp_size}), got seq_len={seq_len}"
+            )
+        half = seq_len // cp_size // 2
         if half <= 0:
             continue
         spans.append((seq_start + cp_rank * half, half))
@@ -405,6 +419,12 @@ def build_packed_allgather_cp_local_positions_from_host(
     table is a closed form over Python ints: zero kernels, zero synchronization,
     one asynchronous host-to-device copy of the finished table.
     """
+    if cp_size <= 1:
+        # Mirror the device builder: at cp_size <= 1 the local layout is the identity,
+        # with no zigzag halving (and therefore no even-length requirement).
+        if output_size is None:
+            output_size = host_cu_seqlens[-1]
+        return _host_to_device(torch.arange(output_size, dtype=torch.int64), device)
     spans = _host_packed_cp_spans(host_cu_seqlens, cp_size, cp_rank)
     real = (
         torch.cat([torch.arange(start, start + length) for start, length in spans])
@@ -462,10 +482,19 @@ def build_packed_allgather_cp_query_positions_and_key_reorder_from_host(
         key_local_output_size = local_output_size
 
     kv_total = host_cu_seqlens_kv[-1]
+    if cp_size <= 1:
+        # Identity layout: the gathered order is already the global order.
+        out = key_local_output_size if key_local_output_size is not None else kv_total
+        return query_positions, _host_to_device(torch.arange(out, dtype=torch.int64), device)
     spans_by_rank = [
         _host_packed_cp_spans(host_cu_seqlens_kv, cp_size, rank) for rank in range(cp_size)
     ]
     real_len = sum(length for _, length in spans_by_rank[0]) if spans_by_rank else 0
+    if real_len * cp_size != kv_total:
+        raise ValueError(
+            "Packed DSA CP spans do not tile the key stream: "
+            f"{cp_size} ranks x {real_len} real tokens != total {kv_total}"
+        )
     out = key_local_output_size if key_local_output_size is not None else real_len
     pad = max(0, out - real_len)
     n = cp_size * out

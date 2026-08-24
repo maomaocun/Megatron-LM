@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import inspect
 import logging
 from importlib import import_module
 from types import ModuleType
@@ -74,6 +75,22 @@ def _log_declined_hook(config: TransformerConfig, hook_name: str, reason: str) -
     )
 
 
+def _hook_kwargs_accepting(fn, **candidate_kwargs):
+    """Keep only the kwargs ``fn`` can accept.
+
+    Backend hooks are resolved dynamically and may live out of tree; passing a
+    keyword an older backend does not know would fail with a TypeError at the
+    first fused call rather than a clean decline.
+    """
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return candidate_kwargs
+    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
+        return candidate_kwargs
+    return {k: v for k, v in candidate_kwargs.items() if k in sig.parameters}
+
+
 def _resolve_fused_hook(config: TransformerConfig, hook_name: str):
     """Return the selected backend's ``hook_name`` callable, or None if unavailable.
 
@@ -136,7 +153,7 @@ def run_fused_qk_topk(
         local_packed_cp_query_len=local_packed_cp_query_len,
         packed_seq_params=packed_seq_params,
         cp_size=cp_size,
-        varlen_is_plain_causal=varlen_is_plain_causal,
+        **_hook_kwargs_accepting(fn, varlen_is_plain_causal=varlen_is_plain_causal),
     )
     if result is None:
         _log_declined_hook(config, "run_fused_qk_topk", "backend returned None")
@@ -197,7 +214,7 @@ def run_fused_qk_topk_with_loss(
         local_packed_cp_query_len=local_packed_cp_query_len,
         packed_seq_params=packed_seq_params,
         cp_size=cp_size,
-        varlen_is_plain_causal=varlen_is_plain_causal,
+        **_hook_kwargs_accepting(fn, varlen_is_plain_causal=varlen_is_plain_causal),
     )
     if result is None:
         _log_declined_hook(config, "run_fused_qk_topk_with_loss", "backend returned None")
@@ -281,7 +298,7 @@ def run_fused_dsa_attention(
         varlen_ends=varlen_ends,
         key_positions=key_positions,
         query_valid_rows=query_valid_rows,
-        varlen_is_plain_causal=varlen_is_plain_causal,
+        **_hook_kwargs_accepting(fn, varlen_is_plain_causal=varlen_is_plain_causal),
         use_relu=use_relu,
         use_local_indexer_varlen=use_local_indexer_varlen,
         single_packed_thd_sequence=single_packed_thd_sequence,

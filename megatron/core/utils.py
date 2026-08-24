@@ -2690,6 +2690,10 @@ _DSA_MARK_STACK: list = []
 def dsa_mark_begin(name: str) -> None:
     """Open a named DSA profiling region in both nsys and the PyTorch profiler."""
     if not is_nvtx_profiling_enabled():
+        # Record the decision so the matching end honours what begin did, even if
+        # profiling is toggled between the two. Today the toggles sit at iteration
+        # boundaries, but that invariant lives in the training loop, not here.
+        _DSA_MARK_STACK.append(None)
         return
     handle = torch.profiler.record_function(name)
     handle.__enter__()
@@ -2699,10 +2703,13 @@ def dsa_mark_begin(name: str) -> None:
 
 def dsa_mark_end(name: str) -> None:
     """Close the region opened by the matching :func:`dsa_mark_begin`."""
-    if not is_nvtx_profiling_enabled() or not _DSA_MARK_STACK:
+    if not _DSA_MARK_STACK:
+        return
+    handle = _DSA_MARK_STACK.pop()
+    if handle is None:
         return
     nvtx_range_pop(name)
-    _DSA_MARK_STACK.pop().__exit__(None, None, None)
+    handle.__exit__(None, None, None)
 
 
 def _nvtx_range_get_func_path():
