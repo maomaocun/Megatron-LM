@@ -2667,51 +2667,6 @@ def configure_nvtx_profiling(enabled: bool) -> None:
     _nvtx_enabled = enabled
 
 
-def is_nvtx_profiling_enabled() -> bool:
-    """Return whether NVTX range profiling is currently enabled."""
-    return _nvtx_enabled
-
-
-# Diagnostic instrumentation for the DSA pre-attention path.
-#
-# nvtx_range_push alone only reaches nsys; record_function alone only reaches the
-# PyTorch profiler's chrome trace. This path carries neither, so a trace shows it
-# only as an undifferentiated stretch of aten ops -- and because
-# AbsorbedMLASelfAttention.forward overrides Attention.forward, MCore's own
-# ...qkv / ...core_attention ranges never fire here either.
-#
-# Begin/end helpers rather than a context manager so the marked regions do not
-# need re-indenting. The stack is module-level and assumes a single-threaded
-# forward, which holds for the training path. Gated on the same --nvtx-ranges
-# switch the rest of MCore uses, so normal training pays nothing.
-_DSA_MARK_STACK: list = []
-
-
-def dsa_mark_begin(name: str) -> None:
-    """Open a named DSA profiling region in both nsys and the PyTorch profiler."""
-    if not is_nvtx_profiling_enabled():
-        # Record the decision so the matching end honours what begin did, even if
-        # profiling is toggled between the two. Today the toggles sit at iteration
-        # boundaries, but that invariant lives in the training loop, not here.
-        _DSA_MARK_STACK.append(None)
-        return
-    handle = torch.profiler.record_function(name)
-    handle.__enter__()
-    nvtx_range_push(name)
-    _DSA_MARK_STACK.append(handle)
-
-
-def dsa_mark_end(name: str) -> None:
-    """Close the region opened by the matching :func:`dsa_mark_begin`."""
-    if not _DSA_MARK_STACK:
-        return
-    handle = _DSA_MARK_STACK.pop()
-    if handle is None:
-        return
-    nvtx_range_pop(name)
-    handle.__exit__(None, None, None)
-
-
 def _nvtx_range_get_func_path():
     """Get the path of a function. Assumes being called from nvtx_range_push/pop.
 
