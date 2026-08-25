@@ -57,6 +57,14 @@ def add_hetero_grid_args(parser: argparse.ArgumentParser) -> argparse.ArgumentPa
             "Requires every encoder DP rank to execute encoder backward on every microbatch."
         ),
     )
+    grid.add_argument(
+        "--mimo-run-input-projections-on-llm-ranks",
+        action="store_true",
+        help=(
+            "Build modality input projections on LLM ranks. Use --no-load-optim "
+            "when loading a checkpoint saved with the other placement."
+        ),
+    )
     return parser
 
 
@@ -70,6 +78,9 @@ def validate_hetero_grid_args(args: argparse.Namespace, world_size: int) -> tupl
         args, "overlap_grad_reduce", False
     ):
         raise ValueError("--encoder-ddp-overlap requires --overlap-grad-reduce")
+
+    if args.mimo_run_input_projections_on_llm_ranks and args.llm_only:
+        raise ValueError("--mimo-run-input-projections-on-llm-ranks cannot be used with --llm-only")
 
     # MoE expert count must divide evenly across the language grid's expert parallelism.
     num_experts = _num_experts(args)

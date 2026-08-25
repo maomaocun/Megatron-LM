@@ -124,6 +124,11 @@ def test_parser_does_not_expose_unsupported_grid_knobs():
     assert not hasattr(args, "llm_expt_dp")
 
 
+def test_parser_exposes_llm_rank_input_projection_flag():
+    args = _parse(["--mimo-run-input-projections-on-llm-ranks"])
+    assert args.mimo_run_input_projections_on_llm_ranks
+
+
 def test_llm_cp_must_be_one():
     args = _layout_8gpu_20l(llm_cp=2)
     with pytest.raises(ValueError, match="CP=1 only"):
@@ -139,6 +144,17 @@ def test_encoder_overlap_requires_grad_reduce():
 def test_encoder_overlap_accepts_uniform_participation_opt_in():
     args = _layout_8gpu_20l(encoder_ddp_overlap=True, overlap_grad_reduce=True)
     assert validate_hetero_grid_args(args, WORLD_SIZE_8) == (4, 4)
+
+
+def test_language_rank_input_projection_accepts_llm_pp1():
+    args = _layout_8gpu_20l(mimo_run_input_projections_on_llm_ranks=True)
+    assert validate_hetero_grid_args(args, WORLD_SIZE_8) == (4, 4)
+
+
+def test_language_rank_input_projection_rejects_llm_only():
+    args = _layout_8gpu_20l(mimo_run_input_projections_on_llm_ranks=True, llm_only=True)
+    with pytest.raises(ValueError, match="cannot be used with --llm-only"):
+        validate_hetero_grid_args(args, WORLD_SIZE_8)
 
 
 def test_llm_only_requires_offset_zero():
