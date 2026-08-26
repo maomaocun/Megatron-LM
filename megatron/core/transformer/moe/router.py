@@ -211,6 +211,8 @@ class TopKRouter(Router):
 
         if self.hash_moe_layer_threshold > 0:
             assert layer_number is not None, "layer_number is required for the hash-based router."
+        # TODO: Before enabling hash routing for MTP, define an MTP-local threshold. Nested
+        # HybridStack layer numbers restart at 1 and cannot use the decoder-global threshold.
         self.is_hash_layer = (
             not self.is_mtp_layer
             and self.hash_moe_layer_threshold > 0
@@ -989,6 +991,10 @@ class InferenceTopKRouter(TopKRouter):
         Args:
             config (TransformerConfig): The configuration for the transformer model.
             pg_collection (ProcessGroupCollection, optional): Process groups for MoE operations.
+            is_mtp_layer (bool): Whether this router belongs to an MTP layer.
+            layer_number (int, optional): Layer number used for metrics and hash-layer selection.
+            hash_moe_layer_threshold (int, optional): Explicit layer-number threshold for
+                hash routing. When omitted, use config.moe_n_hash_layers.
         """
         # Enforce constraints before calling super().__init__
         assert config.moe_router_num_groups is None, (

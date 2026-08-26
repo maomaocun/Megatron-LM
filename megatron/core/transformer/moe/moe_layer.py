@@ -271,15 +271,13 @@ class MoELayer(BaseMoELayer):
         self.tp_ep_group = pg_collection.tp_ep
 
         # Initialize router.
-        router_kwargs = {
-            "config": self.config,
-            "pg_collection": pg_collection,
-            "is_mtp_layer": is_mtp_layer,
-            "layer_number": layer_number,
-        }
-        if hash_moe_layer_threshold is not None:
-            router_kwargs["hash_moe_layer_threshold"] = hash_moe_layer_threshold
-        self.router = self.submodules.router(**router_kwargs)
+        self.router = self.submodules.router(
+            config=self.config,
+            pg_collection=pg_collection,
+            is_mtp_layer=is_mtp_layer,
+            layer_number=layer_number,
+            hash_moe_layer_threshold=hash_moe_layer_threshold,
+        )
         self.tp_group = pg_collection.tp
 
         # Initialize latent projections.

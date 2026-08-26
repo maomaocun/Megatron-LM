@@ -476,8 +476,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
         # Cache whether these optional layernorms are materialized. The split hybrid mHC
         # recompute and fine-grained activation-offloading paths share these predicates.
-        self.mhc_checkpoint_input_layernorm = not isinstance(self.input_layernorm, IdentityOp)
-        self.mhc_checkpoint_pre_mlp_layernorm = not isinstance(self.pre_mlp_layernorm, IdentityOp)
+        self.has_input_layernorm = not isinstance(self.input_layernorm, IdentityOp)
+        self.has_pre_mlp_layernorm = not isinstance(self.pre_mlp_layernorm, IdentityOp)
 
         self.recompute_input_layernorm = False
         self.recompute_pre_mlp_layernorm = False
@@ -639,7 +639,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
         attn_norm_manager = self.off_interface(self.offload_attn_norm, hidden_states, "attn_norm")
         checkpoint_input_layernorm = self.recompute_input_layernorm or (
-            mhc_recompute_manager is not None and self.mhc_checkpoint_input_layernorm
+            mhc_recompute_manager is not None and self.has_input_layernorm
         )
         if checkpoint_input_layernorm:
             self.input_layernorm_checkpoint = tensor_parallel.CheckpointWithoutOutput(
@@ -891,7 +891,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
     ):
         self.mlp_norm_manager = self.off_interface(self.offload_mlp_norm, hidden_states, "mlp_norm")
         checkpoint_pre_mlp_layernorm = self.recompute_pre_mlp_layernorm or (
-            mhc_recompute_manager is not None and self.mhc_checkpoint_pre_mlp_layernorm
+            mhc_recompute_manager is not None and self.has_pre_mlp_layernorm
         )
         if checkpoint_pre_mlp_layernorm:
             self.pre_mlp_norm_checkpoint = tensor_parallel.CheckpointWithoutOutput(
@@ -1825,13 +1825,13 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         """Set the offload modules for the transformer layer."""
         if self.config.fine_grained_activation_offloading:
             self.offload_attn_norm = (
-                "attn_norm" in self.config.offload_modules and self.mhc_checkpoint_input_layernorm
+                "attn_norm" in self.config.offload_modules and self.has_input_layernorm
             )
             self.offload_qkv_linear = "qkv_linear" in self.config.offload_modules
             self.offload_core_attn = "core_attn" in self.config.offload_modules
             self.offload_attn_proj = "attn_proj" in self.config.offload_modules
             self.offload_mlp_norm = (
-                "mlp_norm" in self.config.offload_modules and self.mhc_checkpoint_pre_mlp_layernorm
+                "mlp_norm" in self.config.offload_modules and self.has_pre_mlp_layernorm
             )
             self.offload_expert_fc1 = "expert_fc1" in self.config.offload_modules
             self.offload_moe_act = "moe_act" in self.config.offload_modules
@@ -2225,7 +2225,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
 
         # Optional Input Layer norm
         checkpoint_input_layernorm = self.recompute_input_layernorm or (
-            mhc_recompute_manager is not None and self.mhc_checkpoint_input_layernorm
+            mhc_recompute_manager is not None and self.has_input_layernorm
         )
         attn_norm_manager = self.off_interface(self.offload_attn_norm, hidden_states, "attn_norm")
         if checkpoint_input_layernorm:
@@ -2329,7 +2329,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
 
         # Optional Layer norm post the cross-attention.
         checkpoint_pre_mlp_layernorm = self.recompute_pre_mlp_layernorm or (
-            mhc_recompute_manager is not None and self.mhc_checkpoint_pre_mlp_layernorm
+            mhc_recompute_manager is not None and self.has_pre_mlp_layernorm
         )
         self.mlp_norm_manager = self.off_interface(self.offload_mlp_norm, hidden_states, "mlp_norm")
         if checkpoint_pre_mlp_layernorm:
@@ -2403,7 +2403,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
             and CudaGraphModule.moe_router in self.config.cuda_graph_modules
         ):
             if self.recompute_pre_mlp_layernorm or (
-                mhc_recompute_manager is not None and self.mhc_checkpoint_pre_mlp_layernorm
+                mhc_recompute_manager is not None and self.has_pre_mlp_layernorm
             ):
                 for tensor in mlp_output_with_bias:
                     self.pre_mlp_norm_checkpoint.discard_output_and_register_recompute(tensor)
@@ -2475,7 +2475,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
             output (Tensor): Transformed hidden states of shape [s, b, h].
         """
         if self.recompute_pre_mlp_layernorm or (
-            mhc_mlp_bda_recompute_manager is not None and self.mhc_checkpoint_pre_mlp_layernorm
+            mhc_mlp_bda_recompute_manager is not None and self.has_pre_mlp_layernorm
         ):
             self.pre_mlp_norm_checkpoint.discard_output_and_register_recompute(
                 mlp_output_with_bias[0]
@@ -2633,7 +2633,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         nvtx_range_pop(suffix="mlp_hyper_connection")
 
         checkpoint_pre_mlp_layernorm = self.recompute_pre_mlp_layernorm or (
-            mhc_recompute_manager is not None and self.mhc_checkpoint_pre_mlp_layernorm
+            mhc_recompute_manager is not None and self.has_pre_mlp_layernorm
         )
         if checkpoint_pre_mlp_layernorm:
             self.pre_mlp_norm_checkpoint = tensor_parallel.CheckpointWithoutOutput(

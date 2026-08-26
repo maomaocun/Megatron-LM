@@ -1892,13 +1892,10 @@ class MultiTokenPredictionLayer(MegatronModule):
         mtp_layer_pattern: Optional[str] = None,
         hybrid_submodules: Optional[HybridStackSubmodules] = None,
         mamba_submodules: Optional[HybridStackSubmodules] = None,
-        hash_moe_layer_threshold: int | None = None,
         name: str | None = None,
     ):
         """
         Args:
-            hash_moe_layer_threshold (int, optional): Global Hybrid layer-number threshold used
-                to select hash-routed MoE layers in the nested HybridStack.
             name (str | None): module instance name passed top-down from its paranet module
         """
         super().__init__(config=config)
@@ -2038,7 +2035,6 @@ class MultiTokenPredictionLayer(MegatronModule):
                 pg_collection=pg_collection,
                 is_mtp_layer=True,
                 mtp_layer_number=self.layer_number,
-                hash_moe_layer_threshold=hash_moe_layer_threshold,
                 name=(name + ".mtp_model_layer") if name is not None else None,
             )
         elif self.config.mtp_num_layers is not None:
@@ -2593,6 +2589,10 @@ class MultiTokenPredictionLayer(MegatronModule):
         # Legacy GPT MTP owns one outer checkpoint around its projection and Transformer
         # layer. Hybrid MTP instead delegates full recompute to the nested HybridStack so
         # that ``recompute_num_layers`` controls its layer chunks without nesting checkpoints.
+        # Consequently, ``_concat_embeddings`` (enorm/hnorm, concat, and projections) stays
+        # outside activation checkpointing and retains its activations.
+        # TODO: Consider a separate, method-aware checkpoint for that prefix if profiling shows
+        # its retained memory is material; it must replay FP8 state and TP collectives correctly.
         use_outer_recompute = (
             self.config.recompute_granularity == 'full'
             and self.training
@@ -2745,13 +2745,10 @@ class MultiTokenPredictionBlock(MegatronModule):
         mtp_num_depths: int = 0,
         hybrid_submodules: Optional["HybridStackSubmodules"] = None,
         mamba_submodules: Optional["HybridStackSubmodules"] = None,
-        hash_moe_layer_threshold: int | None = None,
         name: str | None = None,
     ):
         """
         Args:
-            hash_moe_layer_threshold (int, optional): Global Hybrid layer-number threshold passed
-                to each nested MTP HybridStack.
             name (str | None): module instance name passed top-down from its paranet module
         """
         super().__init__(config=config)
@@ -2773,7 +2770,6 @@ class MultiTokenPredictionBlock(MegatronModule):
         self.mtp_layer_pattern = mtp_layer_pattern
         self.mtp_num_depths = mtp_num_depths
         self.hybrid_submodules = hybrid_submodules
-        self.hash_moe_layer_threshold = hash_moe_layer_threshold
         self.mtp_use_repeated_layer = self.config.mtp_use_repeated_layer
         self.name = name
 
@@ -2841,7 +2837,6 @@ class MultiTokenPredictionBlock(MegatronModule):
                     pg_collection=pg_collection,
                     mtp_layer_pattern=mtp_layer_pattern,
                     hybrid_submodules=hybrid_submodules,
-                    hash_moe_layer_threshold=self.hash_moe_layer_threshold,
                     name=(self.name + f".layers.{layer_number}") if self.name is not None else None,
                 )
             return module

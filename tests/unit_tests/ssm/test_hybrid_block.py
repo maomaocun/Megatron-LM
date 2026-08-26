@@ -288,11 +288,9 @@ class TestHybridBlock:
     def test_hash_moe_counts_only_moe_layers(self):
         """Hash routing derives a global layer threshold from the MoE positions."""
         layer_pattern = (Symbols.MLP + Symbols.MOE) * 4
-        mtp_pattern = Symbols.MOE
         config = TransformerConfig(
             hidden_size=256,
             num_layers=len(layer_pattern),
-            mtp_num_layers=1,
             num_attention_heads=4,
             use_cpu_initialization=True,
             num_moe_experts=4,
@@ -310,7 +308,7 @@ class TestHybridBlock:
             hybrid_stack_spec=hybrid_stack_spec,
             vocab_size=128,
             max_sequence_length=8,
-            hybrid_layer_pattern=f"{layer_pattern}/{mtp_pattern}",
+            hybrid_layer_pattern=layer_pattern,
             pg_collection=self.get_pg_collection(),
         )
         block = model.decoder
@@ -325,9 +323,6 @@ class TestHybridBlock:
         assert [layer.layer_number for layer in moe_layers] == [2, 4, 6, 8]
         assert [router.is_hash_layer for router in routers] == [True, True, True, False]
         assert [router.hash_moe_layer_threshold for router in routers] == [6, 6, 6, 6]
-        mtp_router = model.mtp.layers[0].mtp_model_layer.layers[0].mlp.router
-        assert mtp_router.hash_moe_layer_threshold == 6
-        assert not mtp_router.is_hash_layer
         assert model.config.moe_n_hash_layers == 3
 
     def test_hash_moe_pipeline_placement_validation(self):

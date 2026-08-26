@@ -674,7 +674,7 @@ def build_transformer_layer_callables(layer: TransformerLayer):
                 mlp_norm_manager = off_interface(layer.offload_mlp_norm, hidden_states, "mlp_norm")
                 node.layer_state.mlp_norm_manager = mlp_norm_manager
                 checkpoint_pre_mlp_layernorm = layer.recompute_pre_mlp_layernorm or (
-                    mhc_recompute_manager is not None and layer.mhc_checkpoint_pre_mlp_layernorm
+                    mhc_recompute_manager is not None and layer.has_pre_mlp_layernorm
                 )
                 if checkpoint_pre_mlp_layernorm:
                     layer.pre_mlp_norm_checkpoint = tensor_parallel.CheckpointWithoutOutput(

@@ -76,7 +76,7 @@ def checkpointed_forward(
                 else:
                     inner_quantization_context = nullcontext()
 
-                # Build the full TransformerLayer kwarg set. Hybrid mHC wrappers expose
+                # Build the full TransformerLayer kwarg set. Hybrid wrappers expose
                 # an explicit capability flag so this module does not need to import
                 # hybrid_block (which would create a circular import).
                 layer_kwargs = dict(
@@ -94,7 +94,7 @@ def checkpointed_forward(
                 with inner_quantization_context:
                     if isinstance(layer, TransformerLayer):
                         hidden_states, context = layer(**layer_kwargs)
-                    elif getattr(layer, "supports_hybrid_recompute_kwargs", False):
+                    elif getattr(layer, "accepts_hybrid_layer_kwargs", False):
                         # HyperConnectionHybridLayer accepts the routing metadata
                         # consumed by wrapped MoE layers, but not cross-attention kwargs
                         # from the TransformerLayer interface. This also covers a wrapper

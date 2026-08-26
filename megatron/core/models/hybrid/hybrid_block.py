@@ -113,7 +113,11 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
     + the inner router/preprocess submodules for partial MoE capture (experts stay eager).
     """
 
-    supports_hybrid_recompute_kwargs = True
+    # Recompute-dispatch capability: ``forward`` accepts the hybrid-layer kwargs
+    # ``padding_mask`` and ``input_ids`` in addition to the common layer kwargs, but
+    # rejects the TransformerLayer-only cross-attention kwargs ``context``,
+    # ``context_mask``, and ``attention_bias``.
+    accepts_hybrid_layer_kwargs = True
 
     def __init__(self, config: TransformerConfig, layer: MegatronModule) -> None:
         super().__init__(config=config)

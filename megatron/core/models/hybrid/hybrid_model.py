@@ -365,7 +365,6 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 mtp_layer_pattern=self.mtp_pattern,
                 mtp_num_depths=self.mtp_num_depths,
                 hybrid_submodules=hybrid_submodules,
-                hash_moe_layer_threshold=hash_layer_threshold or None,
                 name="mtp",
             )
             self._setup_mtp_cuda_graphs()
