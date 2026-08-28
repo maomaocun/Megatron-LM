@@ -5,6 +5,7 @@ import fnmatch
 import functools
 import logging
 import math
+import os
 import warnings
 from contextlib import nullcontext
 from enum import Enum
@@ -415,6 +416,53 @@ class _ParamAndGradBucketGroup:
         rerun_state_machine = get_rerun_state_machine()
         for i in range(len(self.buckets)):
             grad_norm = self.buckets[i].grad_data.norm(p=2)
+            if (
+                check_for_nan_or_inf
+                and os.environ.get('DSV4_LOG_NONFINITE_GRAD', '0').strip().lower()
+                in {'1', 'true', 'yes', 'on'}
+                and not bool(torch.isfinite(grad_norm).item())
+            ):
+                grad_data = self.buckets[i].grad_data
+                element_finite = bool(torch.isfinite(grad_data).all().item())
+                fp32_norm = grad_data.float().norm(p=2)
+                bad_params = []
+                if not element_finite:
+                    for param in self.buckets[i].params_list:
+                        grad = getattr(param, 'main_grad', None)
+                        if grad is None:
+                            grad = getattr(param, 'grad', None)
+                        if grad is None:
+                            continue
+                        finite = torch.isfinite(grad)
+                        if bool(finite.all().item()):
+                            continue
+                        param_start, param_end = self.buckets[i].param_to_index[param]
+                        bad_params.append(
+                            {
+                                'name': getattr(param, '_dsv4_param_name', '<unnamed>'),
+                                'shape': tuple(param.shape),
+                                'dtype': str(param.dtype),
+                                'nan_count': int(torch.isnan(grad).sum().item()),
+                                'inf_count': int(torch.isinf(grad).sum().item()),
+                                'bucket_offset': (int(param_start), int(param_end)),
+                            }
+                        )
+                        if len(bad_params) >= 8:
+                            break
+                logger.error(
+                    'DSV4 non-finite gradient diagnosis: bucket=%d dtype=%s '
+                    'element_finite=%s bf16_or_native_norm=%s fp32_norm=%s max_abs=%s '
+                    'flat_nan=%d flat_inf=%d bad_params=%s',
+                    i,
+                    grad_data.dtype,
+                    element_finite,
+                    grad_norm,
+                    fp32_norm,
+                    grad_data.float().abs().max(),
+                    int(torch.isnan(self.buckets[i].grad_data).sum().item()),
+                    int(torch.isinf(self.buckets[i].grad_data).sum().item()),
+                    bad_params or ('<no_nonfinite_elements>' if element_finite else '<padding_or_unmapped>'),
+                )
             # check for NaN, Inf and unexpectedly large grads
             if check_for_nan_or_inf:
                 rerun_state_machine.validate_result(

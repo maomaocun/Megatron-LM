@@ -77,6 +77,32 @@ class _WaitForDeferredReduceScatter(torch.autograd.Function):
         return reduced_gradient, None
 
 
+class _CopyAttentionChunk(torch.autograd.Function):
+    """Copy one FlashMLA chunk into a reusable output buffer.
+
+    The buffer is deliberately reused instead of concatenating all chunk
+    outputs.  The custom backward preserves the gradient edge for each chunk
+    while keeping only the chunk-sized gradient copy alive.
+    """
+
+    @staticmethod
+    def forward(ctx, output_buffer: Tensor, chunk_output: Tensor, start: int) -> Tensor:
+        ctx.start = int(start)
+        ctx.num_rows = int(chunk_output.shape[0])
+        output_buffer.data.narrow(0, ctx.start, ctx.num_rows).copy_(chunk_output.data)
+        return output_buffer
+
+    @staticmethod
+    def backward(ctx, grad_output: Tensor):
+        chunk_grad = grad_output.narrow(0, ctx.start, ctx.num_rows).contiguous()
+        return grad_output, chunk_grad, None
+
+
+def copy_attention_chunk(output_buffer: Tensor, chunk_output: Tensor, start: int) -> Tensor:
+    """Copy one row chunk while retaining its autograd edge."""
+    return _CopyAttentionChunk.apply(output_buffer, chunk_output, start)
+
+
 def defer_reduce_scatter_wait(
     input_: Tensor, wait_range: str = "dsv4_cp_reduce_scatter_consumer_wait"
 ):
@@ -281,9 +307,9 @@ def _csa_fwd_flash_mla(
             compact_output=chunk_size > 0 and padded_num_heads > actual_num_heads,
         )
 
-    outputs = []
-    lses = []
-    lse_indexers = []
+    output = None
+    lse = None
+    lse_indexer = None
     for start in range(0, q.size(0), chunk_size):
         end = min(start + chunk_size, q.size(0))
         chunk_output, chunk_lse, chunk_lse_indexer = _csa_fwd_flash_mla_single(
@@ -297,16 +323,26 @@ def _csa_fwd_flash_mla(
             indexer_topk=indexer_topk,
             compact_output=True,
         )
-        outputs.append(chunk_output)
-        lses.append(chunk_lse)
+        if output is None:
+            output = torch.empty(
+                (q.size(0), chunk_output.size(1), chunk_output.size(2)),
+                dtype=chunk_output.dtype,
+                device=chunk_output.device,
+            )
+            lse = torch.empty(
+                (q.size(0), chunk_lse.size(1)),
+                dtype=chunk_lse.dtype,
+                device=chunk_lse.device,
+            )
+            if indexer_topk > 0:
+                lse_indexer = torch.empty_like(lse)
+        output = _CopyAttentionChunk.apply(output, chunk_output, start)
+        lse = _CopyAttentionChunk.apply(lse, chunk_lse, start)
         if indexer_topk > 0:
             assert chunk_lse_indexer is not None
-            lse_indexers.append(chunk_lse_indexer)
+            lse_indexer = _CopyAttentionChunk.apply(lse_indexer, chunk_lse_indexer, start)
 
-    output = torch.cat(outputs, dim=0)
-    lse = torch.cat(lses, dim=0)
     if indexer_topk > 0:
-        lse_indexer = torch.cat(lse_indexers, dim=0)
         if indexer_topk >= topk_idxs.shape[-1]:
             return output, lse, lse.clone()
         return output, lse, lse_indexer
@@ -773,6 +809,7 @@ def local_to_global_flat(
     batch_size: int,
     cu_seqlens_q: Optional[Tensor] = None,
     cu_seqlens_kv: Optional[Tensor] = None,
+    global_start: int = 0,
 ) -> Tensor:
     """Convert local per-sequence indices to global flat indices.
 
@@ -838,7 +875,10 @@ def local_to_global_flat(
             f"cu_seqlens_kv.shape={tuple(cu_seqlens_kv.shape)}"
         )
 
-    row_batch_ids = batch_of_row(cu_seqlens_q, total_q=total_q)
+    global_start = int(global_start)
+    row_batch_ids = batch_of_row(
+        cu_seqlens_q, total_q=global_start + total_q
+    ).narrow(0, global_start, total_q)
     kv_offset = cu_seqlens_kv[row_batch_ids].unsqueeze(1)  # (total_q, 1)
     valid = local_idxs >= 0
     global_idxs = torch.where(valid, local_idxs + kv_offset, local_idxs)
@@ -875,6 +915,7 @@ def build_flat_topk_idxs(
     compact: bool = False,
     cu_seqlens_q: Optional[Tensor] = None,
     cu_seqlens_kv: Optional[Tensor] = None,
+    global_start: int = 0,
 ) -> Tuple[Tensor, Optional[Tensor]]:
     """Combine local per-sequence index groups and convert to flat global form.
 
@@ -912,7 +953,11 @@ def build_flat_topk_idxs(
     # cuDNN compactify kernel returns its per-row ``length`` in, so no
     # extra permute is needed afterward.
     global_idxs = local_to_global_flat(
-        combined, batch_size, cu_seqlens_q=cu_seqlens_q, cu_seqlens_kv=cu_seqlens_kv
+        combined,
+        batch_size,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_kv=cu_seqlens_kv,
+        global_start=global_start,
     )
 
     topk_length_flat = None
@@ -958,15 +1003,37 @@ class CSASparseAttnFunc(torch.autograd.Function):
             indexer_topk=indexer_topk,
         )
 
-        ctx.save_for_backward(q, kv, attn_sink, topk_idxs, out, lse)
+        # The inverse-RoPE bridge may overwrite the returned attention output
+        # in-place to avoid a full-length content/rotary torch.cat(). In that
+        # opt-in mode, retain the compact inputs and recompute ``out`` in
+        # backward instead of saving an alias that the caller will mutate.
+        ctx.recompute_out = os.environ.get('DSV4_CSA_RECOMPUTE_OUT', '0').strip() == '1'
+        if ctx.recompute_out:
+            ctx.save_for_backward(q, kv, attn_sink, topk_idxs, lse)
+        else:
+            ctx.save_for_backward(q, kv, attn_sink, topk_idxs, out, lse)
         ctx.softmax_scale = softmax_scale
         ctx.topk_length = topk_length
+        ctx.indexer_topk = indexer_topk
         return out, lse, lse_indexer
 
     @staticmethod
     def backward(ctx, dO, d_lse, d_lse_indexer):
         """Compute sparse-attention backward via cuDNN DSA wrapper."""
-        q, kv, attn_sink, topk_idxs, out, lse = ctx.saved_tensors
+        if ctx.recompute_out:
+            q, kv, attn_sink, topk_idxs, lse = ctx.saved_tensors
+            with torch.no_grad():
+                out, _, _ = _csa_fwd_flash_mla(
+                    q,
+                    kv,
+                    topk_idxs,
+                    ctx.softmax_scale,
+                    attn_sink=attn_sink,
+                    topk_length=ctx.topk_length,
+                    indexer_topk=ctx.indexer_topk,
+                )
+        else:
+            q, kv, attn_sink, topk_idxs, out, lse = ctx.saved_tensors
         dq, dkv, d_sink = _sparse_attention_backward(
             q,
             kv,
@@ -1278,6 +1345,54 @@ def indexer_topk(
         q_causal_offsets=q_causal_offsets,
     )
     return topk_indices, topk_length
+
+
+def indexer_forward_scores(
+    q_indexer: Tensor,
+    k_indexer: Tensor,
+    weights: Tensor,
+    ratio: int,
+    *,
+    cu_seqlens_q: Tensor,
+    cu_seqlens_kv: Tensor,
+    max_seqlen_q: int,
+    max_seqlen_kv: int,
+    q_causal_offsets: Optional[Tensor] = None,
+) -> Tensor:
+    """Return the CuDNN Indexer score matrix without invoking radix top-k.
+
+    This is an opt-in long-context fallback for cases where the shipped radix
+    top-k wrapper allocates a large architecture-specific workspace.  The
+    score kernel and packed causal metadata are the same as ``indexer_topk``;
+    callers own the final per-row ``torch.topk`` and validity filtering.
+    """
+    if q_indexer.ndim != 3 or k_indexer.ndim != 2 or weights.ndim != 2:
+        raise ValueError(
+            'THD Indexer scores expect q=(rows,heads,dim), k=(kv,dim), '
+            f'w=(rows,heads), got q={tuple(q_indexer.shape)}, '
+            f'k={tuple(k_indexer.shape)}, w={tuple(weights.shape)}'
+        )
+    if q_indexer.shape[0] != weights.shape[0]:
+        raise ValueError(
+            f'Indexer q/weight rows differ: q={q_indexer.shape[0]}, '
+            f'w={weights.shape[0]}'
+        )
+    _ensure_dsa_namespace()
+    forward_kwargs = dict(
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_kv,
+        max_seqlen_q=int(max_seqlen_q),
+        max_seqlen_k=int(max_seqlen_kv),
+    )
+    if q_causal_offsets is not None:
+        forward_kwargs['q_causal_offsets'] = q_causal_offsets
+    return _DSA.indexer_forward_wrapper(
+        q_indexer,
+        k_indexer.unsqueeze(1),
+        weights,
+        ratio=int(ratio),
+        **forward_kwargs,
+    )['scores']
 
 
 # ---------------------------------------------------------------------------

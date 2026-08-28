@@ -38,7 +38,16 @@ else:
     (TEColumnParallelLinear, TELinear, set_save_original_input) = (None, None, None)
 
 
-@torch.compile
+def _compile_dsv4_helper(fn):
+    """Keep the V4 helper compile opt-in for long-context diagnostics."""
+    if os.environ.get('DSV4_DISABLE_V4_HELPER_TORCH_COMPILE', '0').strip().lower() in {
+        '1', 'true', 'yes', 'on'
+    }:
+        return fn
+    return torch.compile(fn)
+
+
+@_compile_dsv4_helper
 def _q_rms_norm(q: torch.Tensor, eps: float) -> torch.Tensor:
     """Fused RMS normalization for query tensor (no learnable weight)."""
     return q * torch.rsqrt(q.square().mean(-1, keepdim=True) + eps)

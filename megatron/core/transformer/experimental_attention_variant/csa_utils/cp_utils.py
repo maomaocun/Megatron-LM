@@ -7,6 +7,7 @@ retained compaction kernel; ``csa.py`` calls final-index lowering directly.
 """
 
 import math
+import os
 from typing import Optional, Tuple
 
 import torch
@@ -16,7 +17,7 @@ from megatron.core.fusions.fused_mla_yarn_rope_apply import fused_mla_rope_inpla
 from megatron.core.models.common.embeddings.rope_utils import _apply_rotary_pos_emb_bshd
 
 from . import cp_layout_kernels
-from .fused_sparse_attention import indexer_topk
+from .fused_sparse_attention import batch_of_row, indexer_forward_scores, indexer_topk
 
 # =============================================================================
 # RoPE Wrappers
@@ -59,20 +60,53 @@ def apply_thd_cp_local_rope_fused(
     squeezed_head = x.ndim == 2
     rope_input = x.squeeze(1) if squeezed_batch else x
     rope_input = rope_input.unsqueeze(1) if squeezed_head else rope_input
-    if inverse:
-        # The fused kernel is in-place, but sparse-attention backward needs its original output.
-        rope_input = rope_input.clone()
-    output = fused_mla_rope_inplace(
-        rope_input,
-        cos,
-        sin,
-        nope_dim,
-        pos_dim,
-        cu_seqlens_q=cu_seqlens_padded,
-        inverse=inverse,
-        remove_interleaving=True,
-        position_ids=position_ids,
-    )
+    recompute_backend = os.environ.get(
+        'DSV4_FUSED_ROPE_RECOMPUTE_BACKEND', 'fused'
+    ).strip().lower()
+    if recompute_backend in {'unfused', 'reference', 'torch'}:
+        # The Triton MLA RoPE kernel is physically in-place and has shown
+        # rank-selective corruption in the CP + full-recompute path.  Use the
+        # same cos/sin values through an out-of-place PyTorch expression for
+        # this explicit safe backend. The default still keeps the fused
+        # kernel. The formula mirrors
+        # ``_mla_rope_fwd_inplace_kernel`` with REMOVE_INTERLEAVING=True.
+        cos_pos = cos.index_select(0, position_ids.long()).view(x.shape[0], 1, pos_dim)
+        sin_pos = sin.index_select(0, position_ids.long()).view(x.shape[0], 1, pos_dim)
+        if inverse:
+            sin_pos = -sin_pos
+        content, rotary = torch.split(rope_input, [nope_dim, pos_dim], dim=-1)
+        half = pos_dim // 2
+        x_left = rotary[..., 0::2]
+        x_right = rotary[..., 1::2]
+        rotated = torch.stack(
+            (
+                x_left * cos_pos[..., :half] - x_right * sin_pos[..., :half],
+                x_right * cos_pos[..., half:] + x_left * sin_pos[..., half:],
+            ),
+            dim=-1,
+        ).flatten(-2)
+        output = torch.cat((content, rotated), dim=-1)
+    else:
+        if inverse or rope_input.requires_grad:
+            # The fused kernel is in-place. During checkpoint recompute the
+            # q/KV projection output is a live autograd value; mutating that
+            # value (or its squeeze view) makes the second forward depend on
+            # an already retained graph and can produce rank-selective NaNs in
+            # CP. Keep the fast no-grad forward in-place, but give
+            # autograd/recompute private storage. The inverse path has always
+            # needed the same protection.
+            rope_input = rope_input.clone()
+        output = fused_mla_rope_inplace(
+            rope_input,
+            cos,
+            sin,
+            nope_dim,
+            pos_dim,
+            cu_seqlens_q=cu_seqlens_padded,
+            inverse=inverse,
+            remove_interleaving=True,
+            position_ids=position_ids,
+        )
     if squeezed_batch:
         return output.unsqueeze(1)
     if squeezed_head:
@@ -274,8 +308,7 @@ def prepare_cp_compressor_input(
     return hidden_compact, compressed_group_ids, seq_to_rank_row
 
 
-@torch.compile
-def _build_cp_indexer_layout(
+def _build_cp_indexer_layout_eager(
     cu_seqlens_q: torch.Tensor,
     cu_seqlens_compressed: torch.Tensor,
     global_start: int,
@@ -301,6 +334,88 @@ def _build_cp_indexer_layout(
     return cu_q_topk, cu_k_topk, q_causal_offsets
 
 
+def _build_cp_indexer_score_tile_layout(
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_compressed: torch.Tensor,
+    global_start: int,
+    local_rows: int,
+    tile_start: int,
+    tile_end: int,
+    ratio: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build THD metadata for a compressed-K tile crossing packed documents."""
+    global_end = int(global_start) + int(local_rows)
+    q_zero = torch.zeros((1,), dtype=cu_seqlens_q.dtype, device=cu_seqlens_q.device)
+    q_start = torch.tensor(global_start, dtype=cu_seqlens_q.dtype, device=cu_seqlens_q.device)
+    q_end = torch.tensor(global_end, dtype=cu_seqlens_q.dtype, device=cu_seqlens_q.device)
+    q_piece_start = torch.maximum(cu_seqlens_q[:-1], q_start)
+    q_piece_end = torch.minimum(cu_seqlens_q[1:], q_end)
+    q_lens = (q_piece_end - q_piece_start).clamp_min(0)
+    q_prefix = torch.cumsum(q_lens, dim=0, dtype=torch.int32)
+    q_padding = (q_end - torch.maximum(cu_seqlens_q[-1], q_start)).clamp_min(0)
+    cu_q_tile = torch.cat((q_zero, q_prefix, (q_prefix[-1] + q_padding).view(1)))
+
+    k_zero = torch.zeros(
+        (1,), dtype=cu_seqlens_compressed.dtype, device=cu_seqlens_compressed.device
+    )
+    k_start = torch.tensor(
+        int(tile_start), dtype=cu_seqlens_compressed.dtype, device=cu_seqlens_compressed.device
+    )
+    k_end = torch.tensor(
+        int(tile_end), dtype=cu_seqlens_compressed.dtype, device=cu_seqlens_compressed.device
+    )
+    k_piece_start = torch.maximum(cu_seqlens_compressed[:-1], k_start)
+    k_piece_end = torch.minimum(cu_seqlens_compressed[1:], k_end)
+    k_lens = (k_piece_end - k_piece_start).clamp_min(0)
+    k_prefix = torch.cumsum(k_lens, dim=0, dtype=torch.int32)
+    cu_k_tile = torch.cat((k_zero, k_prefix, k_prefix[-1].view(1)))
+
+    q_rel_start = q_piece_start - cu_seqlens_q[:-1]
+    k_rel_start = k_piece_start - cu_seqlens_compressed[:-1]
+    has_rows = (q_lens > 0) & (k_lens > 0)
+    q_causal_offsets = torch.where(
+        has_rows,
+        q_rel_start - k_rel_start * int(ratio),
+        torch.zeros_like(q_rel_start),
+    )
+    q_causal_offsets = torch.cat((q_causal_offsets, q_zero))
+    # Match the synthetic tail segment present in both cumulative layouts so
+    # row-to-segment mapping remains valid for capacity padding rows.
+    k_lens_with_tail = torch.cat((k_lens, k_lens.new_zeros((1,))))
+    k_rel_start_with_tail = torch.cat(
+        (k_rel_start, k_rel_start.new_zeros((1,)))
+    )
+    return (
+        cu_q_tile,
+        cu_k_tile,
+        q_causal_offsets,
+        k_lens_with_tail,
+        k_rel_start_with_tail,
+    )
+
+
+def _compile_cp_helper(fn):
+    """Keep CP metadata compilation opt-in for long-context diagnostics."""
+    if os.environ.get('DSV4_DISABLE_V4_HELPER_TORCH_COMPILE', '0').strip().lower() in {
+        '1', 'true', 'yes', 'on'
+    }:
+        return fn
+    return torch.compile(fn)
+
+
+@_compile_cp_helper
+def _build_cp_indexer_layout(
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_compressed: torch.Tensor,
+    global_start: int,
+    local_rows: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build packed metadata on the compiled main attention path."""
+    return _build_cp_indexer_layout_eager(
+        cu_seqlens_q, cu_seqlens_compressed, global_start, local_rows
+    )
+
+
 def compute_cp_indexer_topk(
     q_indexer_local: torch.Tensor,
     weights_indexer_local: torch.Tensor,
@@ -313,12 +428,15 @@ def compute_cp_indexer_topk(
     indexer_softmax_scale: float,
     max_seqlen_q: int,
     use_fused: bool,
+    max_seqlen_kv: Optional[int] = None,
 ) -> Tuple[Optional[torch.Tensor], Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]]:
     """Return local top-k and its local-Q/full-K packed layout."""
     topk_width = int(topk_width)
     if topk_width == 0 or k_indexer_seq_major.shape[0] == 0:
         return None, None
-    max_seqlen_kv = int(max_seqlen_q) // int(ratio)
+    max_seqlen_kv = (
+        int(max_seqlen_kv) if max_seqlen_kv is not None else int(max_seqlen_q) // int(ratio)
+    )
     if max_seqlen_kv == 0:
         return None, None
 
@@ -330,6 +448,195 @@ def compute_cp_indexer_topk(
             f"{l_local}, got {weights_indexer_local.shape[0]}."
         )
 
+    # CuDNN's radix top-k wrapper has a large fixed workspace on the H200
+    # image.  For very long K, keep the same fused score kernel and perform
+    # the final top-k over its bounded query chunk in PyTorch. This path is
+    # explicit and opt-in; the default remains the production radix kernel.
+    topk_backend = os.environ.get('DSV4_INDEXER_TOPK_BACKEND', '').strip().lower()
+    if topk_backend in {'score_topk', 'score_tile_topk'}:
+        if indexer_softmax_scale != 1.0:
+            weights_for_scores = (
+                weights_indexer_local.float() * float(indexer_softmax_scale)
+            ).to(weights_indexer_local.dtype)
+        else:
+            weights_for_scores = weights_indexer_local
+
+    if topk_backend == 'score_tile_topk':
+        try:
+            score_tile_size = int(
+                os.environ.get('DSV4_INDEXER_SCORE_TILE_SIZE', '8192') or 8192
+            )
+        except ValueError:
+            score_tile_size = 8192
+        score_tile_size = max(score_tile_size, 1)
+        best_values = None
+        best_indices = None
+        key_count = k_indexer_seq_major.shape[0]
+        for tile_start in range(0, key_count, score_tile_size):
+            tile_end = min(tile_start + score_tile_size, key_count)
+            tile_len = tile_end - tile_start
+            tile_k = k_indexer_seq_major.narrow(0, tile_start, tile_len)
+            (
+                tile_q_cu,
+                tile_k_cu,
+                tile_q_offsets,
+                tile_k_lens,
+                tile_k_rel_start,
+            ) = _build_cp_indexer_score_tile_layout(
+                cu_seqlens_q,
+                cu_seqlens_compressed,
+                global_start,
+                l_local,
+                tile_start,
+                tile_end,
+                ratio,
+            )
+            scores = indexer_forward_scores(
+                q_indexer_local,
+                tile_k,
+                weights_for_scores,
+                ratio,
+                cu_seqlens_q=tile_q_cu,
+                cu_seqlens_kv=tile_k_cu,
+                max_seqlen_q=l_local,
+                max_seqlen_kv=tile_len,
+                q_causal_offsets=tile_q_offsets,
+            )
+            row_sequence_ids = batch_of_row(tile_q_cu, total_q=l_local)
+            row_k_lens = tile_k_lens[row_sequence_ids]
+            row_valid = torch.arange(
+                l_local, device=q_indexer_local.device, dtype=torch.int64
+            ) < tile_q_cu[-2].to(torch.int64)
+            key_positions = torch.arange(
+                scores.shape[-1], device=scores.device, dtype=torch.int64
+            )
+            scores = scores.masked_fill(
+                key_positions.unsqueeze(0) >= row_k_lens.to(torch.int64).unsqueeze(1),
+                float('-inf'),
+            )
+            selected_width = min(topk_width, tile_len)
+            tile_values, tile_indices = torch.topk(
+                scores, selected_width, dim=-1
+            )
+            tile_valid = torch.isfinite(tile_values)
+            tile_indices = (
+                tile_indices.to(torch.int32)
+                + tile_k_rel_start[row_sequence_ids].to(torch.int32).unsqueeze(1)
+            )
+            tile_valid = tile_valid & row_valid.unsqueeze(1)
+            tile_indices = tile_indices.masked_fill(~tile_valid, -1)
+            if selected_width < topk_width:
+                padding_shape = (l_local, topk_width - selected_width)
+                tile_values = torch.cat(
+                    (
+                        tile_values,
+                        torch.full(
+                            padding_shape,
+                            float('-inf'),
+                            dtype=tile_values.dtype,
+                            device=tile_values.device,
+                        ),
+                    ),
+                    dim=-1,
+                )
+                tile_indices = torch.cat(
+                    (
+                        tile_indices,
+                        torch.full(
+                            padding_shape,
+                            -1,
+                            dtype=torch.int32,
+                            device=tile_indices.device,
+                        ),
+                    ),
+                    dim=-1,
+                )
+            if best_values is None:
+                best_values = tile_values
+                best_indices = tile_indices
+            else:
+                candidate_values = torch.cat((best_values, tile_values), dim=-1)
+                candidate_indices = torch.cat((best_indices, tile_indices), dim=-1)
+                best_values, selected = torch.topk(
+                    candidate_values, topk_width, dim=-1
+                )
+                best_indices = torch.gather(candidate_indices, -1, selected)
+                best_indices = best_indices.masked_fill(
+                    ~torch.isfinite(best_values), -1
+                )
+                del candidate_values, candidate_indices, selected
+            del scores, tile_values, tile_indices, tile_valid
+        if best_indices is None:
+            return None, None
+        return best_indices, None
+
+    if topk_backend == 'score_topk':
+        if k_indexer_seq_major.shape[0] == 0:
+            return None, None
+        try:
+            score_chunk_size = int(
+                os.environ.get('DSV4_INDEXER_SCORE_CHUNK_SIZE', '128') or 128
+            )
+        except ValueError:
+            score_chunk_size = 128
+        score_chunk_size = max(score_chunk_size, 1)
+
+        # The score wrapper returns [query_rows, compressed_K] fp32.  Process
+        # bounded subchunks and immediately reduce each one to top-k; keeping
+        # the outer query chunk intact would still allocate hundreds of MiB at
+        # 256K even though the final indices are only a few MiB.
+        index_chunks = []
+        rows = q_indexer_local.shape[0]
+        for local_start in range(0, rows, score_chunk_size):
+            local_end = min(local_start + score_chunk_size, rows)
+            # This inner loop deliberately stays eager.  The outer helper is
+            # compiled for the normal path, but each score subchunk has a new
+            # Python offset/shape; compiling it here creates one Inductor
+            # graph per 128-row position at long context.
+            sub_q_cu, sub_k_cu, sub_offsets = _build_cp_indexer_layout_eager(
+                cu_seqlens_q,
+                cu_seqlens_compressed,
+                global_start + local_start,
+                local_end - local_start,
+            )
+            scores = indexer_forward_scores(
+                q_indexer_local[local_start:local_end],
+                k_indexer_seq_major,
+                weights_for_scores[local_start:local_end],
+                ratio,
+                cu_seqlens_q=sub_q_cu,
+                cu_seqlens_kv=sub_k_cu,
+                # The sub-layout contains only this bounded query interval.
+                # Passing the original 256K stride here needlessly makes the
+                # CuDNN score kernel size its workspace for the whole sample.
+                max_seqlen_q=min(int(max_seqlen_q), local_end - local_start),
+                max_seqlen_kv=int(max_seqlen_kv),
+                q_causal_offsets=sub_offsets,
+            )
+            max_score_k = scores.shape[-1]
+            selected_width = min(topk_width, max_score_k)
+            if selected_width == 0:
+                continue
+            values, indices = torch.topk(scores, selected_width, dim=-1)
+            selected_valid = torch.isfinite(values)
+            indices = indices.to(torch.int32).masked_fill(~selected_valid, -1)
+            if selected_width < topk_width:
+                padding = torch.full(
+                    (local_end - local_start, topk_width - selected_width),
+                    -1,
+                    dtype=torch.int32,
+                    device=q_indexer_local.device,
+                )
+                indices = torch.cat((indices, padding), dim=-1)
+            index_chunks.append(indices)
+            del scores, values, selected_valid, indices
+        if not index_chunks:
+            return None, None
+        return torch.cat(index_chunks, dim=0), None
+
+    # The experimental score branches build their own eager metadata.  Keep
+    # the compiled layout exclusively on the default radix path; otherwise a
+    # long-context query chunk would pay for an unused graph specialization.
     cu_q_topk, cu_k_topk, q_causal_offsets = _build_cp_indexer_layout(
         cu_seqlens_q, cu_seqlens_compressed, global_start, l_local
     )

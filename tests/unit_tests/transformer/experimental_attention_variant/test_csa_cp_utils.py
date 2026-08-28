@@ -122,6 +122,7 @@ def test_apply_thd_cp_local_rope_matches_reference_forward_backward(dtype, inver
     expected.backward(grad)
 
     actual_x = x.detach().clone().requires_grad_(True)
+    input_before = actual_x.detach().clone()
     actual = apply_thd_cp_local_rope_fused(
         actual_x, cos, sin, nope_dim, pos_dim, cu, global_start, inverse=inverse
     )
@@ -129,6 +130,10 @@ def test_apply_thd_cp_local_rope_matches_reference_forward_backward(dtype, inver
     rtol, atol = (1e-5, 1e-5) if dtype == torch.float32 else (2e-2, 5e-2)
     torch.testing.assert_close(actual, expected, rtol=rtol, atol=atol)
     torch.testing.assert_close(actual_x.grad, ref_x.grad, rtol=rtol, atol=atol)
+    # The recompute path runs with a live autograd input.  The fused kernel is
+    # physically in-place, so the wrapper must protect the projection output
+    # from mutation in that case.
+    torch.testing.assert_close(actual_x, input_before)
 
 
 def test_apply_thd_cp_local_rope_maps_invalid_boundary_rows_to_position_zero():
@@ -143,6 +148,33 @@ def test_apply_thd_cp_local_rope_maps_invalid_boundary_rows_to_position_zero():
     expected = _rope_reference(x, cos, sin, positions, 4, 4)
     actual = apply_thd_cp_local_rope_fused(x, cos, sin, 4, 4, cu, global_start)
     torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.parametrize("inverse", [False, True])
+def test_apply_thd_cp_local_rope_recompute_reference_backend(monkeypatch, inverse):
+    """The recompute fallback must match RoPE and preserve its input."""
+    _require_cuda()
+    monkeypatch.setenv("DSV4_FUSED_ROPE_RECOMPUTE_BACKEND", "unfused")
+    torch.manual_seed(23)
+    cu = torch.tensor([0, 4, 12], dtype=torch.int32, device="cuda")
+    global_start = 2
+    rows = torch.arange(global_start, global_start + 4, dtype=torch.int32, device="cuda")
+    positions = _sequence_positions(cu, rows)
+    x = torch.randn(4, 2, 8, dtype=torch.float32, device="cuda", requires_grad=True)
+    before = x.detach().clone()
+    cos = torch.randn(8, 4, dtype=torch.float32, device="cuda")
+    sin = torch.randn(8, 4, dtype=torch.float32, device="cuda")
+
+    expected_x = x.detach().clone().requires_grad_(True)
+    expected = _rope_reference(expected_x, cos, sin, positions, 4, 4, inverse)
+    grad = torch.randn_like(expected)
+    expected.backward(grad)
+
+    actual = apply_thd_cp_local_rope_fused(x, cos, sin, 4, 4, cu, global_start, inverse)
+    actual.backward(grad)
+    torch.testing.assert_close(actual, expected)
+    torch.testing.assert_close(x.grad, expected_x.grad)
+    torch.testing.assert_close(x, before)
 
 
 @pytest.mark.parametrize("inverse", [False, True])

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import functools
 import logging
+import os
 import warnings
 from abc import ABC
 from dataclasses import dataclass, field
@@ -958,6 +959,12 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             and not inference_context.is_decode_only()
             and not isinstance(self.mlp, IdentityOp)
             and not self.config.transformer_impl == "inference_optimized"
+        )
+        should_chunk_mlp_for_training = (
+            self.config.mlp_chunks_for_training > 1
+            and inference_context is None
+            and self.training
+            and not isinstance(self.mlp, IdentityOp)
         )
         should_chunk_mlp_for_training = (
             self.config.mlp_chunks_for_training > 1
@@ -2365,10 +2372,67 @@ class HyperConnectionTransformerLayer(TransformerLayer):
                     False,
                     pre_mlp_layernorm_output,
                 )
-        elif should_chunk_mlp_for_prefill:
-            num_chunks = min(self.config.mlp_chunks_for_prefill, pre_mlp_layernorm_output.shape[0])
+        elif should_chunk_mlp_for_prefill or should_chunk_mlp_for_training:
+            num_chunks = min(
+                (
+                    self.config.mlp_chunks_for_prefill
+                    if should_chunk_mlp_for_prefill
+                    else self.config.mlp_chunks_for_training
+                ),
+                pre_mlp_layernorm_output.shape[0],
+            )
             chunks = pre_mlp_layernorm_output.chunk(num_chunks, dim=0)
-            outputs = [self.mlp(chunk) for chunk in chunks]
+            input_id_chunks = [None] * num_chunks
+            if self.is_moe_layer and input_ids is not None:
+                if input_ids.shape[0] == pre_mlp_layernorm_output.shape[0]:
+                    input_id_chunks = list(input_ids.chunk(num_chunks, dim=0))
+                elif input_ids.ndim > 1 and input_ids.shape[1] == pre_mlp_layernorm_output.shape[0]:
+                    input_id_chunks = list(input_ids.chunk(num_chunks, dim=1))
+                else:
+                    raise ValueError(
+                        "Cannot chunk input_ids with the MLP input for mHC MoE training: "
+                        f"input_ids shape={tuple(input_ids.shape)}, "
+                        f"mlp input shape={tuple(pre_mlp_layernorm_output.shape)}"
+                    )
+            padding_mask_chunks = [None] * num_chunks
+            if self.is_moe_layer and padding_mask is not None:
+                if padding_mask.shape[0] == pre_mlp_layernorm_output.shape[1]:
+                    # padding_mask is normally [batch, sequence].
+                    padding_mask_chunks = list(padding_mask.chunk(num_chunks, dim=1))
+                elif padding_mask.shape[0] == pre_mlp_layernorm_output.shape[0]:
+                    padding_mask_chunks = list(padding_mask.chunk(num_chunks, dim=0))
+                else:
+                    raise ValueError(
+                        "Cannot chunk padding_mask with the MLP input for mHC MoE training: "
+                        f"padding_mask shape={tuple(padding_mask.shape)}, "
+                        f"mlp input shape={tuple(pre_mlp_layernorm_output.shape)}"
+                    )
+            outputs = []
+            checkpoint_mlp_chunks = (
+                os.environ.get('DSV4_MLP_CHUNK_CHECKPOINT', '0').strip().lower()
+                in {'1', 'true', 'yes', 'on'}
+                and self.training
+                and torch.is_grad_enabled()
+            )
+            for chunk, input_id_chunk, padding_mask_chunk in zip(
+                chunks, input_id_chunks, padding_mask_chunks
+            ):
+                chunk_kwargs = {}
+                if self.is_moe_layer:
+                    if input_id_chunk is not None:
+                        chunk_kwargs["input_ids"] = input_id_chunk
+                    if padding_mask_chunk is not None:
+                        chunk_kwargs["padding_mask"] = padding_mask_chunk
+                if checkpoint_mlp_chunks:
+                    outputs.append(
+                        tensor_parallel.checkpoint(
+                            functools.partial(self.mlp, **chunk_kwargs),
+                            False,
+                            chunk,
+                        )
+                    )
+                else:
+                    outputs.append(self.mlp(chunk, **chunk_kwargs))
             mlp_output = torch.cat([out for out, _ in outputs], dim=0)
             bias_chunks = [bias for _, bias in outputs if bias is not None]
             bias_output = torch.stack(bias_chunks, dim=0).sum(dim=0) if bias_chunks else None

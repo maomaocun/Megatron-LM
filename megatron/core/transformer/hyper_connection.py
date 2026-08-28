@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import math
+import os
 from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
@@ -20,8 +21,23 @@ _MHC_SINKHORN_EPS = 1e-6
 _MHC_COMPUTE_H_EPS = 1e-6
 
 
+def _compile_mhc(fn):
+    """Compile native mHC helpers unless a diagnostic requests eager mode.
+
+    The default remains the existing ``torch.compile`` path.  The explicit
+    escape hatch is useful for isolating model/parallelism behavior from the
+    many per-rank Inductor compilations during a long-context canary; it is not
+    a production performance setting.
+    """
+    if os.environ.get('DSV4_DISABLE_V4_HELPER_TORCH_COMPILE', '0').strip().lower() in {
+        '1', 'true', 'yes', 'on'
+    }:
+        return fn
+    return torch.compile(fn)
+
+
 # dynamic=True handles the hybrid mHC variable-shape path (was blanket-disabled)
-@torch.compile
+@_compile_mhc
 def _sinkhorn_iterations(input_logits: Tensor, num_iterations: int, eps: float) -> Tensor:
     M = input_logits.softmax(dim=-1) + eps
     M = M / (M.sum(dim=-2, keepdim=True) + eps)
@@ -65,7 +81,7 @@ def native_sinkhorn(input_logits: Tensor, num_iterations: int, eps: float = 1e-6
 
 
 # dynamic=True handles the hybrid mHC variable-shape path (was blanket-disabled)
-@torch.compile
+@_compile_mhc
 def native_h_aggregate(x: Tensor, h_pre: Tensor) -> Tensor:
     """Native n-stream weighted aggregation: out = sum_j(h_pre_j * x_j)."""
     return (x * h_pre.unsqueeze(-1)).sum(dim=2)
@@ -128,7 +144,7 @@ def native_h_aggregate_into(x: Tensor, h_pre: Tensor, out: Tensor) -> Tensor:
 
 
 # dynamic=True handles the hybrid mHC variable-shape path (was blanket-disabled)
-@torch.compile
+@_compile_mhc
 def native_h_post_bda(
     h_res: Tensor, original_residual: Tensor, h_post: Tensor, x: Tensor, bias: Optional[Tensor]
 ) -> Tensor:
@@ -145,7 +161,7 @@ def native_h_post_bda(
 
 
 # dynamic=True handles the hybrid mHC variable-shape path (was blanket-disabled)
-@torch.compile
+@_compile_mhc
 def native_proj_rms(x: Tensor, weight: Tensor, eps: float = 1e-6) -> Tuple[Tensor, Tensor]:
     """Native fused projection + RMS normalization."""
     proj = torch.matmul(x, weight.t())
@@ -157,7 +173,7 @@ def native_proj_rms(x: Tensor, weight: Tensor, eps: float = 1e-6) -> Tuple[Tenso
 
 
 # dynamic=True handles the hybrid mHC variable-shape path (was blanket-disabled)
-@torch.compile
+@_compile_mhc
 def native_fused_add_3(a: Tensor, b: Tensor, c: Tensor) -> Tensor:
     """Native 3-way elementwise add (torch.compile fuses into single kernel)."""
     return a + b + c
@@ -190,7 +206,7 @@ class BroadcastTensorFused(torch.autograd.Function):
         return ctx.fused_add_3_fn(grad1, grad2, grad3), None
 
 
-@torch.compile
+@_compile_mhc
 def learned_output_contract(
     hidden_states: Tensor, head_fn: Tensor, base: Tensor, scale: Tensor, n: int, eps: float
 ) -> Tensor:
@@ -335,7 +351,7 @@ class HyperConnectionModule(MegatronModule):
         return proj.view(s, b, proj.shape[-1]), r.view(s, b, 1)
 
     # dynamic=True handles the hybrid mHC variable-shape path (was blanket-disabled)
-    @torch.compile
+    @_compile_mhc
     def _compute_h(self, proj: Tensor, r: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
         """
         Compute h from projected hidden states and scaling factors.
@@ -421,7 +437,7 @@ class HyperConnectionModule(MegatronModule):
         return h_pre.to(dtype), h_post.to(dtype), h_res.to(dtype)
 
     # dynamic=True handles the hybrid mHC variable-shape path (was blanket-disabled)
-    @torch.compile
+    @_compile_mhc
     def _apply_h_post(self, x: Tensor, h_post: Tensor) -> Tensor:
         """
         Core implementation of H_post application to a single tensor.
@@ -523,7 +539,7 @@ class HyperConnectionModule(MegatronModule):
         return self._h_aggregate_into_op(x_streams, h_pre, out)
 
     # dynamic=True handles the hybrid mHC variable-shape path (was blanket-disabled)
-    @torch.compile
+    @_compile_mhc
     def apply_h_res(self, h_res: Tensor, residual: Tensor) -> Tensor:
         """
         Apply H_res to residual using H_res weights.

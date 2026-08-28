@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import logging
+import os
 from contextlib import contextmanager
 from typing import Optional
 
@@ -120,6 +121,13 @@ class DistributedDataParallel(_BaseDataParallel):
             self.params_with_grad.append(param)
 
             param.grad_added_to_main_grad = False
+            if os.environ.get('DSV4_LOG_NONFINITE_GRAD', '0').strip().lower() in {
+                '1', 'true', 'yes', 'on'
+            }:
+                # Keep the name next to the Parameter only for the opt-in
+                # diagnostics in ParamAndGradBuffer.check_grads(). Avoid
+                # changing the normal DDP object graph or log volume.
+                param._dsv4_param_name = name
             param_to_name[param] = name
             all_params.append(param)
 
